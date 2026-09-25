@@ -1,0 +1,654 @@
+---
+title: "Image Compression with Principal Components Analysis"
+author: "Ayaan Karim-Ali"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+library(readr)
+
+## Formatting helpers for numbers quoted in the text
+fmt <- function(x, digits = 0)
+        format(round(x, digits), big.mark = ",", nsmall = digits,
+               scientific = FALSE)
+pct <- function(x, digits = 1)
+        paste0(format(round(100 * x, digits), nsmall = digits), "%")
+```
+
+## Overview
+
+An image stored as an $n \times p$ matrix $X$ can be rebuilt from its principal
+components. Writing the eigendecomposition of the cross product as
+$X'X = U \Lambda U'$ and setting $Z = XU$ gives the identity $X = ZU'$, because
+$U$ is orthonormal. Keeping only the first $k$ columns of $Z$ and $U$ produces
+the rank $k$ approximation
+
+$$X^{(k)} = z_1u_1' + z_2u_2' + \cdots + z_ku_k'$$
+
+which stores $k(n + p)$ numbers instead of $n \times p$. The error of that
+approximation is measured by the Frobenius norm of $X - X^{(k)}$.
+
+The columns of $X$ are not centered before the decomposition. Centering is the
+usual first step in PCA, as in Section 12.2 of *An Introduction to Statistical
+Learning*, but the target here is the stored values themselves, and working
+with $X$ as stored keeps the identity $X = ZU'$ exact without a separate vector
+of column means. Each eigenvalue is then the sum of squares of the image along
+its direction, and the eigenvalues add up to the sum of every squared entry of
+$X$. When this page reports the proportion of variation held by the first $k$
+components, it means the share of that total.
+
+The same bookkeeping ties the two main measures on this page together. The
+squared Frobenius error at rank $k$ equals the sum of the eigenvalues left out,
+so the error curve and the proportion of variation are two views of one
+quantity. The decomposition of total variation in equation 12.11 of that
+chapter says the same thing for centered data.
+
+## The compression function
+
+The function below takes an image matrix and a rank $k$, and returns the rank
+$k$ approximation along with its Frobenius error.
+
+```{r compress-function}
+## Compute the rank-k approximation to an image matrix using PCA.
+##
+##   x : an n x p numeric matrix holding the image
+##   k : the rank of the approximation, an integer from 1 to p
+##
+## Returns a list holding the approximation, its Frobenius error, and k.
+compress_image <- function(x, k) {
+        x <- data.matrix(x)
+        p <- ncol(x)
+
+        if (k < 1 || k > p)
+                stop("k must be between 1 and ", p)
+
+        ## Eigendecomposition of the cross product V = X'X.  V is symmetric,
+        ## so eigen() returns the eigenvalues in decreasing order and the
+        ## first column of U is the leading eigenvector.
+        v <- crossprod(x)
+        e <- eigen(v, symmetric = TRUE)
+        u <- e$vectors
+
+        ## Z = XU holds the principal component scores
+        z <- x %*% u
+
+        ## The rank-k approximation is the sum of the first k outer products
+        ## z_j u_j', which equals Z[, 1:k] U[, 1:k]'
+        approx <- z[, 1:k, drop = FALSE] %*% t(u[, 1:k, drop = FALSE])
+
+        list(approximation = approx,
+             error = norm(x - approx, type = "F"),
+             k = k)
+}
+```
+
+Two checks confirm the function behaves as the identity above requires. At
+$k = p$ the approximation should reproduce the original matrix exactly, and the
+error should fall to zero.
+
+```{r function-check}
+x <- data.matrix(read_csv("image3.csv"))
+
+## An intermediate rank
+compress_image(x, 10)$error
+
+## The full rank approximation returns the original matrix back
+full <- compress_image(x, ncol(x))
+full$error
+max(abs(x - full$approximation))
+```
+
+Both numbers at full rank sit at the level of floating point rounding, so the
+function returns $X$ exactly when every component is kept.
+
+## Supporting functions
+
+Calling `compress_image()` separately for every rank would repeat the
+eigendecomposition hundreds of times, so the error curve uses a version that
+decomposes once and then adds one outer product at a time. A check at the end
+of this section confirms the two agree.
+
+Every panel in a row of approximations is shaded on the original image's grey
+scale, with the original's smallest value in black and its largest in white,
+so equal values look equal from one panel to the next. Values in an
+approximation that fall outside that range are drawn at the nearest end. The
+panels for images 3 and 4 keep the true proportions of each image. Images 1
+and 2 are ten times taller than they are wide, so their panels are stretched
+sideways to keep single columns visible.
+
+Eigenvectors are only defined up to a sign change, and flipping the sign of
+$u_1$ and $z_1$ together leaves $z_1u_1'$ unchanged. The eigenvector plots fix
+the sign so that the largest weight is positive, which makes the plots for the
+four images comparable.
+
+```{r helpers}
+## Frobenius error for every rank from 1 to p
+compression_errors <- function(x) {
+        x <- data.matrix(x)
+        p <- ncol(x)
+
+        e <- eigen(crossprod(x), symmetric = TRUE)
+        u <- e$vectors
+        z <- x %*% u
+
+        approx <- matrix(0, nrow(x), p)
+        err <- numeric(p)
+
+        for (k in seq_len(p)) {
+                approx <- approx + z[, k] %o% u[, k]
+                err[k] <- norm(x - approx, type = "F")
+        }
+        data.frame(k = seq_len(p), error = err)
+}
+
+## Eigenvalues of X'X, largest first.  Values that come out a hair below
+## zero from rounding are set to zero.
+eigenvalues <- function(x) {
+        lambda <- eigen(crossprod(data.matrix(x)), symmetric = TRUE,
+                        only.values = TRUE)$values
+        pmax(lambda, 0)
+}
+
+## Smallest k whose first k components hold at least the given share of the
+## total sum of squares
+components_needed <- function(lambda, share) {
+        which(cumsum(lambda) / sum(lambda) >= share)[1]
+}
+
+## Storage for a rank-k approximation as a percentage of the original
+storage_percent <- function(x, k) {
+        100 * k * (nrow(x) + ncol(x)) / (nrow(x) * ncol(x))
+}
+
+## Draw a matrix as a greyscale image.  image() treats the first index as the
+## horizontal axis, so the matrix is transposed and its rows reversed to come
+## out in the orientation we expect.  zlim sets the grey scale, and
+## keep_shape = TRUE draws the image in its true proportions.
+show_image <- function(x, title = "", zlim = range(x), keep_shape = TRUE) {
+        x <- pmin(pmax(x, zlim[1]), zlim[2])
+        image(t(x)[, nrow(x):1], zlim = zlim,
+              col = grey(seq(0, 1, length.out = 256)),
+              axes = FALSE, main = title, useRaster = TRUE,
+              asp = if (keep_shape) nrow(x) / ncol(x) else NA)
+}
+
+## The original image followed by the first ten approximations
+plot_approximations <- function(x, per_row = 11, keep_shape = TRUE) {
+        x <- data.matrix(x)
+        op <- par(mfrow = c(ceiling(11 / per_row), per_row),
+                  mar = c(0.5, 0.5, 2, 0.5))
+        on.exit(par(op))
+        show_image(x, "Original", keep_shape = keep_shape)
+        for (k in 1:10)
+                show_image(compress_image(x, k)$approximation,
+                           paste0("k = ", k), zlim = range(x),
+                           keep_shape = keep_shape)
+}
+
+## The original next to larger views of selected ranks
+plot_selected <- function(x, ks) {
+        x <- data.matrix(x)
+        op <- par(mfrow = c(1, length(ks) + 1), mar = c(0.5, 0.5, 3, 0.5))
+        on.exit(par(op))
+        show_image(x, "Original")
+        for (k in ks)
+                show_image(compress_image(x, k)$approximation,
+                           paste0("k = ", k, ", ",
+                                  round(storage_percent(x, k)),
+                                  "% of original size"),
+                           zlim = range(x))
+}
+
+## Frobenius error against rank, for every possible rank
+plot_error_curve <- function(x, name) {
+        d <- compression_errors(x)
+        op <- par(mar = c(4.5, 4.5, 3, 1))
+        on.exit(par(op))
+        plot(d$k, d$error, type = "l", lwd = 2, col = "steelblue",
+             xlab = "Rank k", ylab = "Frobenius error",
+             main = paste("Approximation error vs. k:", name))
+        points(d$k[1:10], d$error[1:10], pch = 19, col = "darkorange", cex = 0.8)
+        grid(col = "grey90")
+        invisible(d)
+}
+
+## The first eigenvector and the first PC score, with the sign fixed so that
+## the largest weight in the eigenvector is positive
+plot_first_components <- function(x, name) {
+        x <- data.matrix(x)
+        e <- eigen(crossprod(x), symmetric = TRUE)
+        u1 <- e$vectors[, 1]
+        if (u1[which.max(abs(u1))] < 0)
+                u1 <- -u1
+        z1 <- as.vector(x %*% u1)
+
+        op <- par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+        on.exit(par(op))
+        plot(u1, type = "l", lwd = 2, col = "firebrick",
+             xlab = "Column of the image", ylab = "Weight",
+             main = paste("First eigenvector:", name))
+        abline(h = 0, lty = 3, col = "grey50")
+        plot(z1, type = "l", lwd = 2, col = "darkgreen",
+             xlab = "Row of the image", ylab = "Score",
+             main = paste("First PC score:", name))
+        abline(h = 0, lty = 3, col = "grey50")
+
+        invisible(list(u1 = u1, z1 = z1))
+}
+
+## Proportion of the total held by the first k components
+variance_table <- function(x, ks = c(1, 2, 5, 10, 20, 50)) {
+        lambda <- eigenvalues(x)
+        cum <- cumsum(lambda) / sum(lambda)
+        ks <- ks[ks <= length(lambda)]
+        data.frame(k = ks, cumulative_proportion = round(cum[ks], 4))
+}
+
+## Scree plot: proportion of the total held by each of the first m components
+plot_scree <- function(lambda, name, m = 20) {
+        m <- min(m, length(lambda))
+        prop <- lambda / sum(lambda)
+        op <- par(mar = c(4.5, 4.5, 3, 1))
+        on.exit(par(op))
+        plot(seq_len(m), prop[1:m], type = "b", pch = 19, col = "purple4",
+             ylim = c(0, 1), xlab = "Principal component",
+             ylab = "Proportion of variation",
+             main = paste("Scree plot, first", m, "components:", name))
+        grid(col = "grey90")
+}
+```
+
+```{r helpers-check}
+## The fast error curve agrees with the direct function at k = 10
+all.equal(compression_errors(x)$error[10], compress_image(x, 10)$error)
+```
+
+## Image 1
+
+```{r img1-load}
+img1 <- data.matrix(read_csv("image1.csv"))
+dim(img1)
+range(img1)
+```
+
+### Original and the first ten approximations
+
+```{r img1-approx, fig.width = 11, fig.height = 4.4}
+plot_approximations(img1, keep_shape = FALSE)
+```
+
+### Approximation error
+
+```{r img1-error, fig.width = 8, fig.height = 4}
+err1 <- plot_error_curve(img1, "Image 1")
+variance_table(img1)
+```
+
+### First eigenvector and first PC score
+
+```{r img1-components, fig.width = 10, fig.height = 4}
+c1 <- plot_first_components(img1, "Image 1")
+```
+
+```{r img1-details}
+## The column carrying the large weight, and the largest weight elsewhere
+spike <- which.max(abs(c1$u1))
+spike
+max(abs(c1$u1[-spike]))
+
+## Range of the scores, and the scores against themselves 100 rows later
+range(c1$z1)
+cor(c1$z1[1:900], c1$z1[101:1000])
+```
+
+**Interpretation.** The first eigenvector is flat at zero across the width of
+the image apart from one spike. Column `r spike` carries a weight of
+`r fmt(c1$u1[spike], 3)`, and no other weight is larger than
+`r fmt(max(abs(c1$u1[-spike])), 3)` in size. An eigenvector assigns one
+weight to each column, so a single spike means the first component reads one
+column and ignores the rest of the width. That column is the bright vertical
+line in the original.
+
+The first PC score gives one value per row and measures how strongly each row
+expresses the pattern. With nearly all of the weight on one column, each score
+is close to the value of the line in that row. The scores stay between
+`r fmt(min(c1$z1), 1)` and `r fmt(max(c1$z1), 1)`, so the line keeps a
+steady brightness from top to bottom. The score plot also shows ten matching
+cycles, with the same dips and peaks recurring every 100 rows, and the scores
+correlate at `r fmt(cor(c1$z1[1:900], c1$z1[101:1000]), 3)` with themselves
+shifted down by 100 rows. The brightness along the line is one sequence of 100
+values repeated ten times. The rank 1 approximation places that sequence in
+column `r spike` and leaves the rest of the frame close to zero, which is what
+the $k = 1$ panel shows.
+
+### How large does $k$ need to be?
+
+```{r img1-scree, fig.width = 8, fig.height = 4}
+lambda1 <- eigenvalues(img1)
+plot_scree(lambda1, "Image 1")
+```
+
+The scree plot has one point far above the rest. The first eigenvalue is
+`r fmt(lambda1[1])`, and the other `r length(lambda1) - 1` sit between
+`r fmt(min(lambda1[-1]))` and `r fmt(lambda1[2])`, so even the largest of them
+is about `r round(lambda1[1] / lambda1[2])` times smaller than the first. They
+decline evenly, with no second break anywhere in the tail. Eigenvalues that
+stay in a narrow band with no break are what independent noise produces,
+because noise has no preferred direction and spreads its sum of squares across
+all of them.
+
+The error curve shows the same thing from the other side. With no components
+the error equals the size of the image itself, `r fmt(norm(img1, "F"))`, and
+the first component cuts it to `r fmt(err1$error[1])`. After that the curve
+falls in a nearly straight line to zero, each added component removing a
+similar small slice of noise. From $k = 2$ onward the approximation panels only
+add grain to the background.
+
+**I would stop at $k = 1$ for this image.** The bright line is the only
+structure present, and the rank 1 approximation reproduces it, repeating
+pattern included. The remaining `r ncol(img1) - 1` components rebuild noise.
+Chasing a lower Frobenius error here would mean spending storage to rebuild
+randomness, which works against the purpose of compression. At $k = 1$ the
+image takes `r fmt(nrow(img1) + ncol(img1))` numbers instead of
+`r fmt(length(img1))`.
+
+## Image 2
+
+```{r img2-load}
+img2 <- data.matrix(read_csv("image2.csv"))
+dim(img2)
+range(img2)
+```
+
+### Original and the first ten approximations
+
+```{r img2-approx, fig.width = 11, fig.height = 4.4}
+plot_approximations(img2, keep_shape = FALSE)
+```
+
+### Approximation error
+
+```{r img2-error, fig.width = 8, fig.height = 4}
+err2 <- plot_error_curve(img2, "Image 2")
+variance_table(img2)
+```
+
+### First eigenvector and first PC score
+
+```{r img2-components, fig.width = 10, fig.height = 4}
+c2 <- plot_first_components(img2, "Image 2")
+```
+
+```{r img2-details}
+## How closely the weights follow the column number
+cor(c2$u1, seq_along(c2$u1))
+
+## How closely the scores follow the row averages
+cor(c2$z1, rowMeans(img2))
+```
+
+**Interpretation.** The first eigenvector is a straight line. Its weights rise
+in equal steps from `r fmt(c2$u1[1], 4)` at the first column to
+`r round(c2$u1[ncol(img2)], 3)` at the last, and they correlate with the column
+number at `r fmt(cor(c2$u1, seq_along(c2$u1)), 4)`. Every weight has the same
+sign and grows with its column number, so the pattern the component describes
+is a ramp, a steady change in brightness from the left edge of the image to the
+right.
+
+The first PC score gives one number per row, and it scatters on both sides of
+zero with no trend down the image. Each row of the rank 1 approximation is the
+same ramp multiplied by that row's score. A row with a large positive score
+brightens quickly from left to right, a row with a large negative score darkens
+at the same rate, and a row with a score near zero stays flat. The original
+matches this description: every row starts at nearly the same grey on the left
+edge, and the rows spread apart toward the right, which produces the stripes.
+The scores also correlate with the row averages at
+`r fmt(cor(c2$z1, rowMeans(img2)), 4)`, since the average of a scaled ramp is
+the ramp's average times the score.
+
+### How large does $k$ need to be?
+
+```{r img2-scree, fig.width = 8, fig.height = 4}
+lambda2 <- eigenvalues(img2)
+plot_scree(lambda2, "Image 2")
+```
+
+The first eigenvalue holds essentially the entire sum of squares. The second is
+`r signif(lambda2[2], 2)` against a total of `r fmt(sum(lambda2))`, and every
+later eigenvalue is smaller still, so the scree plot is a single point at one
+followed by zeros. The image is effectively a rank 1 matrix stored as 1,000 by
+100 numbers. The error curve agrees. The error at $k = 1$ is already down to
+`r round(err2$error[1], 2)`, against `r fmt(norm(img2, "F"))` for the image as a
+whole, and it is essentially zero from $k = 2$ on.
+
+**$k = 1$ is enough here, and the case is stronger than for any of the other
+three images.** The $k = 1$ panel cannot be told apart from the original. The
+image compresses from `r fmt(length(img2))` numbers to
+`r fmt(nrow(img2) + ncol(img2))`, about
+`r round(storage_percent(img2, 1))`% of its original size, with no loss anyone
+could see.
+
+## Image 3
+
+```{r img3-load}
+img3 <- data.matrix(read_csv("image3.csv"))
+dim(img3)
+range(img3)
+```
+
+### Original and the first ten approximations
+
+```{r img3-approx, fig.width = 11, fig.height = 4.8}
+plot_approximations(img3, per_row = 6)
+```
+
+### Approximation error
+
+```{r img3-error, fig.width = 8, fig.height = 4}
+err3 <- plot_error_curve(img3, "Image 3")
+variance_table(img3)
+```
+
+### First eigenvector and first PC score
+
+```{r img3-components, fig.width = 10, fig.height = 4}
+c3 <- plot_first_components(img3, "Image 3")
+```
+
+```{r img3-details}
+## Smallest and largest weights in the first eigenvector
+range(c3$u1)
+
+## How closely the scores follow the row averages
+cor(c3$z1, rowMeans(img3))
+```
+
+**Interpretation.** Every weight in the first eigenvector has the same sign,
+so the first component adds the columns together rather than setting one part
+of the frame against another. The weights are far from equal, though. They run
+from `r fmt(min(c3$u1), 3)` to `r fmt(max(c3$u1), 3)`, lowest near both
+edges and especially over the first 75 or so columns on the left, and highest
+in several bands through the middle and right of the frame. Those columns count
+for more in each score.
+
+The first PC score gives one value per row and tracks how bright that row is.
+It correlates with the row averages at `r fmt(cor(c3$z1, rowMeans(img3)), 3)`.
+The scores fall below zero from roughly row 60 to row 230, which is where the
+puppy's dark head and body sit, and rise above zero near the top of the frame
+and toward the bottom, where the background and bedding are lighter. The score
+can take both signs because image 3 holds negative values as well as positive
+ones, as the range printed above shows.
+
+Multiplying the two together gives a rank 1 image in which every row has the
+same horizontal shape, scaled up or down. The $k = 1$ panel shows exactly that
+structure: a darker block across the rows where the puppy sits, vertical
+banding from the uneven weights, and no recognizable subject, since a single
+outer product cannot change the pattern from one row to the next.
+
+### How large does $k$ need to be?
+
+```{r img3-scree, fig.width = 8, fig.height = 4}
+lambda3 <- eigenvalues(img3)
+plot_scree(lambda3, "Image 3")
+```
+
+The eigenvalues fall away quickly instead of leveling off, which is how a real
+photograph behaves. It takes `r components_needed(lambda3, 0.90)` components
+to reach 90% of the total sum of squares, `r components_needed(lambda3, 0.95)`
+to reach 95%, and `r components_needed(lambda3, 0.99)` to reach 99%. The scree plot bends after
+the second or third component, and the elbow rule described in ISLR would stop
+there. That rule is meant for choosing how many components to plot or
+interpret, though, and the $k = 3$ panel is far from a usable picture. For
+compression the test is the picture itself. The puppy becomes identifiable
+around $k = 5$ or $k = 6$, and by $k = 10$ the head and the white paw are
+clear, though edges are still soft and streaks run across the bedding. The
+comparison below sets $k = 10$ and $k = 30$ next to the original.
+
+```{r img3-choice, fig.width = 11, fig.height = 4.4}
+plot_selected(img3, c(10, 30))
+```
+
+**I would choose $k = 30$ for this image.** By that point the error curve has
+flattened, the approximation holds
+`r pct(sum(lambda3[1:30]) / sum(lambda3))` of the total sum of squares, and
+most of the streaking visible at $k = 10$ has faded. It still buys real
+compression: storing 30 components takes $30 \times (376 + 345) = 21{,}630$
+numbers against 129,720 for the original, about 17% of the original size. If
+the image only needed to be recognizable rather than clean, $k = 10$ would do
+at about 6%.
+
+## Image 4
+
+```{r img4-load}
+img4 <- data.matrix(read_csv("image4.csv"))
+dim(img4)
+range(img4)
+```
+
+### Original and the first ten approximations
+
+```{r img4-approx, fig.width = 11, fig.height = 7}
+plot_approximations(img4, per_row = 6)
+```
+
+### Approximation error
+
+```{r img4-error, fig.width = 8, fig.height = 4}
+err4 <- plot_error_curve(img4, "Image 4")
+variance_table(img4)
+```
+
+### First eigenvector and first PC score
+
+```{r img4-components, fig.width = 10, fig.height = 4}
+c4 <- plot_first_components(img4, "Image 4")
+```
+
+```{r img4-details}
+## Columns where the eigenvector's weights are largest
+range(which(c4$u1 > 0.1))
+
+## The ten rows with the largest scores
+top4 <- sort(order(c4$z1, decreasing = TRUE)[1:10])
+top4
+
+## How closely the scores follow the row averages
+cor(c4$z1, rowMeans(img4))
+```
+
+**Interpretation.** The first eigenvector here looks nothing like the smooth
+profile in image 3. Its weights sit close to zero across most of the width, dip
+slightly below zero between roughly columns 20 and 55, and rise to a tall
+plateau between columns `r min(which(c4$u1 > 0.1))` and
+`r max(which(c4$u1 > 0.1))`, where they reach about `r round(max(c4$u1), 2)`.
+The first component depends mostly on that one vertical band of the image.
+
+The first PC score is modest for most rows. Its ten largest values all fall
+between rows `r min(top4)` and `r max(top4)`, and a second, smaller peak sits
+near row 60. Those coordinates match the bright rectangle in the lower middle
+of the original and the bright spot above it, so the leading component in this
+image locates the brightest object in the scene rather than an overall
+brightness level. The score drops below zero higher up in the frame and near
+the bottom, where the same band of columns is darker than usual. The $k = 1$
+panel shows the result: its contrast sits in one vertical band, bright where
+the rectangle and the spot are and dark above and below them, with a nearly
+flat grey everywhere else.
+
+Because each score depends on a narrow band of columns far more than on the
+rest of the row, the score follows the row averages only loosely, correlating
+at `r fmt(abs(cor(c4$z1, rowMeans(img4))), 2)` against
+`r fmt(abs(cor(c3$z1, rowMeans(img3))), 3)` for image 3. The mixed signs in
+the eigenvector also say something about the data. An image with no negative
+values produces a first eigenvector whose weights share one sign, so image 4
+must hold negative values as well as positive ones, which the range printed
+above confirms.
+
+### How large does $k$ need to be?
+
+```{r img4-scree, fig.width = 8, fig.height = 4}
+lambda4 <- eigenvalues(img4)
+plot_scree(lambda4, "Image 4")
+```
+
+This image spreads its sum of squares more evenly across components than image
+3 does. The first component holds `r pct(lambda4[1] / sum(lambda4))` of the
+total, against `r pct(lambda3[1] / sum(lambda3))` for image 3, and it takes
+`r components_needed(lambda4, 0.90)` components to pass 90% and
+`r components_needed(lambda4, 0.99)` to pass 99%. The scree plot bends after
+the second or third component here as well, and the same caution about the
+elbow rule applies. The bright spots in the scene are visible by $k = 5$, but
+the surrounding texture stays smeared well past $k = 10$.
+
+```{r img4-choice, fig.width = 11, fig.height = 6}
+plot_selected(img4, c(10, 30))
+```
+
+**I would choose $k = 30$ here as well.** Reaching 99% of the total takes
+`r components_needed(lambda4, 0.99)` components, and the texture keeps
+improving past $k = 10$ in a way the first two images do not. At $k = 30$ the
+storage cost is $30 \times (213 + 119) = 9{,}960$ numbers against 25,347 for
+the original, about 39% of the original size. The compression is weaker than
+for image 3 because an image whose variation is spread across many components
+leaves less redundancy for PCA to exploit.
+
+## Summary
+
+```{r summary-table}
+images <- list(img1, img2, img3, img4)
+lambdas <- list(lambda1, lambda2, lambda3, lambda4)
+chosen <- c(1, 1, 30, 30)
+rows <- sapply(images, nrow)
+cols <- sapply(images, ncol)
+
+summary_table <- data.frame(
+        image = paste("Image", 1:4),
+        rows = rows,
+        columns = cols,
+        k_90 = sapply(lambdas, components_needed, share = 0.90),
+        k_95 = sapply(lambdas, components_needed, share = 0.95),
+        k_99 = sapply(lambdas, components_needed, share = 0.99),
+        chosen_k = chosen,
+        numbers_stored = chosen * (rows + cols),
+        percent_of_original = round(100 * chosen * (rows + cols) / (rows * cols), 1)
+)
+knitr::kable(summary_table,
+             col.names = c("Image", "Rows", "Columns", "k for 90%",
+                           "k for 95%", "k for 99%", "Chosen k",
+                           "Numbers stored", "% of original size"))
+```
+
+The four images fall into two groups. Images 1 and 2 each contain one real
+component, plus noise in the case of image 1, so rank 1 is enough and the
+compression is dramatic. Images 3 and 4 are photographs whose variation is
+spread across many components, and they need a few dozen components before the
+approximation stops visibly improving. How much PCA can compress an image
+depends on how quickly its eigenvalues decay, and that is a property of the
+image rather than of the method.
